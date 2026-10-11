@@ -11,6 +11,31 @@ The backend defaults to the existing checkpoints relative to `backend/main.py`:
 
 Set `PRIMARY_MODEL_PATH` or `BODY_PART_MODEL_PATH` to override either default. The legacy `MODEL_PATH` remains a fallback override for Model 1.
 
+### Render model checkpoint bootstrap (no persistent disk)
+
+When the checkpoint files are not present locally, the FastAPI application downloads them from a **private Supabase Storage bucket during startup**. It downloads to a temporary file, checks the required SHA-256 hash, and only then atomically places the checkpoint at its existing configured model path. Invalid credentials, missing objects, incomplete configuration, oversized files, or hash mismatches fail backend startup; model inference and names are unchanged.
+
+For the Render FastAPI service, create a private bucket (default name `lameguard-models`) and upload:
+
+- `models/lameness_best.pt`
+- `models/body_parts_best.pt`
+
+Set these environment variables on the **FastAPI backend service only**:
+
+| Variable | Value |
+|---|---|
+| `MODEL_STORAGE_SUPABASE_URL` | HTTPS project URL for the private model-storage Supabase project |
+| `MODEL_STORAGE_SUPABASE_SERVICE_ROLE_KEY` | That project's service-role key; backend-only secret, never a `NEXT_PUBLIC_` variable |
+| `MODEL_STORAGE_BUCKET` | `lameguard-models`, unless you used another private bucket name |
+| `PRIMARY_MODEL_SHA256` | `2c16432374dce1f734e394e586dab2d9b39fa5a71f84b8b7365d9e833a8c92d0` for the current `lameness_best.pt` |
+| `BODY_PART_MODEL_SHA256` | `7bdb391c05e070c5dd3062808c6801a8c7775d39939a83c2b94c9626f6320daf` for the current `body_parts_best.pt` |
+
+The default object paths are the two paths listed above. Override them with `PRIMARY_MODEL_OBJECT_PATH` and `BODY_PART_MODEL_OBJECT_PATH` only if the uploaded object keys differ. Keep `PRIMARY_MODEL_PATH` and `BODY_PART_MODEL_PATH` unset to retain the backend's existing `backend/models/...` destination paths; if overriding them, ensure the target directories are writable in Render's ephemeral filesystem.
+
+The service-role key has broad access and bypasses Supabase RLS. Prefer a **separate Supabase project dedicated to model artifacts** to limit its access to LameGuard user and prediction data. Store the key only in Render's backend environment settings, never in GitHub, frontend settings, logs, or any `NEXT_PUBLIC_` variable. The bucket must remain private; startup uses authenticated Storage REST downloads and refuses redirects. `*.pt` checkpoints remain excluded from Git. Replace the documented hashes and Render environment values whenever the checkpoint files change.
+
+The backend continues to report checkpoint presence through `/health`; `*_model_loaded` remains false until inference first loads that model. Confirm deployment by checking both `*_checkpoint_present` values and then making a real inference request.
+
 Model 1's lameness class/confidence is kept separate from Model 2's descriptive object detections. Model 2 reports normalized box bounds, dimensions, area, confidence, per-class counts, missing returned classes, and IoU for overlapping boxes. Bounding boxes are not anatomical keypoints; missing detections do not imply anatomical absence or a healthy cow. Model 2 does not classify lameness.
 
 ## Requirements
@@ -40,6 +65,13 @@ Keep any existing `.env.local` values. The application needs:
 - `PREDICTION_SIGNING_SECRET`: a random server-only secret of at least 32 bytes, shared by Next.js and FastAPI. Keep it out of all `NEXT_PUBLIC_` variables. A value generated in `.env.local` is loaded by Next.js and by the FastAPI command below; do not commit this file.
 
 Corepack and pnpm are not required. Restart the Next.js dev server after editing `.env.local`.
+
+For a deployed frontend, set `NEXT_PUBLIC_API_BASE_URL` in the frontend host's
+build environment to the actual HTTPS base URL of the separately hosted FastAPI
+service. Do not set it to the LameGuard frontend URL. Next.js embeds this
+`NEXT_PUBLIC_` value at build time, so redeploy the frontend after changing it.
+The prediction client rejects a missing, malformed, or same-origin frontend URL
+instead of silently sending `/predict` to the Next.js app.
 
 ## FastAPI setup (Windows PowerShell)
 

@@ -139,10 +139,33 @@ function validateResult(
 }
 
 function assertApiBaseUrl() {
-  if (!apiBaseUrl) {
-    throw new Error('Prediction service is not configured. Set NEXT_PUBLIC_API_BASE_URL in .env.local.')
+  const configuredUrl = apiBaseUrl?.trim()
+  if (!configuredUrl) {
+    throw new Error(
+      'Prediction service is not configured. Set NEXT_PUBLIC_API_BASE_URL to the absolute FastAPI backend URL in the frontend build environment, then redeploy.',
+    )
   }
-  return apiBaseUrl.replace(/\/$/, '')
+
+  let backendUrl: URL
+  try {
+    backendUrl = new URL(configuredUrl)
+  } catch {
+    throw new Error(
+      'NEXT_PUBLIC_API_BASE_URL must be an absolute HTTP(S) URL for the FastAPI backend.',
+    )
+  }
+  if (backendUrl.protocol !== 'http:' && backendUrl.protocol !== 'https:') {
+    throw new Error(
+      'NEXT_PUBLIC_API_BASE_URL must be an absolute HTTP(S) URL for the FastAPI backend.',
+    )
+  }
+  if (typeof window !== 'undefined' && backendUrl.origin === window.location.origin) {
+    throw new Error(
+      'NEXT_PUBLIC_API_BASE_URL points to the LameGuard frontend, not FastAPI. Set it to the actual backend service URL in the frontend build environment, then redeploy.',
+    )
+  }
+
+  return configuredUrl.replace(/\/+$/, '')
 }
 
 function requestError(cause: unknown) {

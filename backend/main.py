@@ -10,8 +10,12 @@ import re
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 
 import cv2
 import numpy as np
@@ -109,7 +113,201 @@ BODY_PART_LABELS = {
 }
 BODY_PART_CLASSES = tuple(sorted(BODY_PART_LABELS))
 
-app = FastAPI(title="LameGuard Experimental YOLO26 Analysis API")
+MAX_MODEL_CHECKPOINT_BYTES = 512 * 1024 * 1024
+
+
+class RejectModelRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file, code, message, headers, new_url):
+        return None
+
+
+def checkpoint_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def required_checkpoint_sha256(env_name: str) -> str:
+    expected = os.getenv(env_name, "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", expected):
+        raise RuntimeError(
+            f"{env_name} must be set to the expected 64-character SHA-256 checkpoint hash."
+        )
+    return expected
+
+
+def download_checkpoint(
+    *,
+    model_label: str,
+    path: Path,
+    object_path: str,
+    expected_sha256: str,
+    storage_url: str,
+    storage_key: str,
+    bucket: str,
+) -> None:
+    encoded_bucket = urllib.parse.quote(bucket, safe="")
+    encoded_object_path = "/".join(
+        urllib.parse.quote(part, safe="") for part in object_path.split("/")
+    )
+    request = urllib.request.Request(
+        f"{storage_url.rstrip('/')}/storage/v1/object/{encoded_bucket}/{encoded_object_path}",
+        headers={
+            "apikey": storage_key,
+            "Authorization": f"Bearer {storage_key}",
+        },
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        opener = urllib.request.build_opener(RejectModelRedirects())
+        with opener.open(request, timeout=60) as response:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=f".{path.name}.",
+                suffix=".download",
+                dir=path.parent,
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                digest = hashlib.sha256()
+                total_bytes = 0
+                while chunk := response.read(1024 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_MODEL_CHECKPOINT_BYTES:
+                        raise RuntimeError(
+                            f"The private {model_label} checkpoint exceeds the 512 MiB download limit."
+                        )
+                    temporary_file.write(chunk)
+                    digest.update(chunk)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+
+        if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+            raise RuntimeError(
+                f"The downloaded {model_label} checkpoint failed SHA-256 verification; "
+                "check its stored file and configured hash."
+            )
+        if temporary_path is None:
+            raise RuntimeError(
+                f"The downloaded {model_label} checkpoint could not be staged for verification."
+            )
+        os.replace(temporary_path, path)
+        temporary_path = None
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(
+            f"Private Supabase Storage returned HTTP {error.code} for the {model_label} checkpoint; "
+            "check the private bucket, object path, and backend credential."
+        ) from None
+    except urllib.error.URLError:
+        raise RuntimeError(
+            f"Could not reach private Supabase Storage to download the {model_label} checkpoint."
+        ) from None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def prepare_model_checkpoints() -> None:
+    storage_url = os.getenv("MODEL_STORAGE_SUPABASE_URL", "").strip()
+    storage_key = os.getenv("MODEL_STORAGE_SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if bool(storage_url) != bool(storage_key):
+        raise RuntimeError(
+            "Set both MODEL_STORAGE_SUPABASE_URL and "
+            "MODEL_STORAGE_SUPABASE_SERVICE_ROLE_KEY for private model downloads."
+        )
+
+    checkpoints = (
+        (
+            "primary lameness",
+            PRIMARY_MODEL_PATH,
+            "PRIMARY_MODEL_SHA256",
+            "PRIMARY_MODEL_OBJECT_PATH",
+            "models/lameness_best.pt",
+        ),
+        (
+            "body-part",
+            BODY_PART_MODEL_PATH,
+            "BODY_PART_MODEL_SHA256",
+            "BODY_PART_MODEL_OBJECT_PATH",
+            "models/body_parts_best.pt",
+        ),
+    )
+    if not storage_url:
+        for model_label, path, sha_env, _, _ in checkpoints:
+            if not path.is_file():
+                raise RuntimeError(
+                    f"The {model_label} checkpoint is missing at {path}. "
+                    "Provide the local model file or configure private Supabase model storage."
+                )
+            expected = os.getenv(sha_env, "").strip()
+            if expected:
+                verified_hash = required_checkpoint_sha256(sha_env)
+                if not hmac.compare_digest(checkpoint_sha256(path), verified_hash):
+                    raise RuntimeError(
+                        f"The local {model_label} checkpoint failed SHA-256 verification."
+                    )
+        return
+
+    parsed_storage_url = urllib.parse.urlsplit(storage_url)
+    if (
+        parsed_storage_url.scheme != "https"
+        or not parsed_storage_url.netloc
+        or parsed_storage_url.path not in {"", "/"}
+        or parsed_storage_url.username
+        or parsed_storage_url.password
+        or parsed_storage_url.query
+        or parsed_storage_url.fragment
+    ):
+        raise RuntimeError(
+            "MODEL_STORAGE_SUPABASE_URL must be an HTTPS Supabase project URL without credentials or query parameters."
+        )
+    bucket = os.getenv("MODEL_STORAGE_BUCKET", "lameguard-models").strip()
+    if not bucket:
+        raise RuntimeError("MODEL_STORAGE_BUCKET must name the private model bucket.")
+
+    prepared_checkpoints = []
+    for model_label, path, sha_env, object_env, default_object_path in checkpoints:
+        expected_sha256 = required_checkpoint_sha256(sha_env)
+        object_path = os.getenv(object_env, default_object_path).strip().strip("/")
+        if not object_path or any(
+            part in {"", ".", ".."} for part in object_path.split("/")
+        ):
+            raise RuntimeError(
+                f"{object_env} must be a relative object path inside the private model bucket."
+            )
+        prepared_checkpoints.append((model_label, path, object_path, expected_sha256))
+
+    for model_label, path, object_path, expected_sha256 in prepared_checkpoints:
+        if path.is_file():
+            try:
+                if hmac.compare_digest(checkpoint_sha256(path), expected_sha256):
+                    continue
+            except OSError:
+                pass
+        download_checkpoint(
+            model_label=model_label,
+            path=path,
+            object_path=object_path,
+            expected_sha256=expected_sha256,
+            storage_url=storage_url,
+            storage_key=storage_key,
+            bucket=bucket,
+        )
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    prepare_model_checkpoints()
+    yield
+
+
+app = FastAPI(
+    title="LameGuard Experimental YOLO26 Analysis API",
+    lifespan=lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
