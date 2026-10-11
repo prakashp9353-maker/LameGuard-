@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server'
 import { createServerSupabaseClient } from '@/lib/supabase/server'
 
 export const runtime = 'nodejs'
-export const maxDuration = 900
+export const maxDuration = 60
 
 const STORAGE_BUCKET = process.env.NEXT_PUBLIC_SUPABASE_STORAGE_BUCKET || 'lameguard-images'
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024
